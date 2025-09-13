@@ -1,0 +1,88 @@
+name: PR Auto-Fixer
+
+on:
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-fix:
+    if: >
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested')
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request
+          && contains(github.event.comment.body, '@pr-auto-fixer retry'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref || '' }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps (pnpm if available else npm)
+        run: |
+          corepack enable
+          if [ -f pnpm-lock.yaml ]; then pnpm i --frozen-lockfile; else npm ci || npm i; fi
+
+      - name: Apply review suggestions
+        run: node .github/scripts/apply-suggestions.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+
+      - name: Prettier --write
+        run: npx prettier . --write || true
+
+      - name: ESLint --fix
+        run: npx eslint . --ext .js,.jsx,.ts,.tsx --fix || true
+
+      - name: Stylelint --fix (optional)
+        run: npx stylelint "**/*.{css,scss}" --fix || true
+
+      - name: Type check (no emit; non-blocking)
+        run: npx tsc -p . --noEmit || true
+
+      - name: AI micro-fixes (guard-railed)
+        if: env.ENABLE_AI == '1'
+        run: node .github/scripts/ai-micro-fixes.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+
+      - name: Commit & push if changed
+        id: commit
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.email "${{ vars.BOT_EMAIL || 'bot@users.noreply.github.com' }}"
+            git config user.name  "${{ vars.BOT_NAME  || 'PR Auto-Fixer' }}"
+            git add -A
+            git commit -m "chore(bot): auto-apply review suggestions & lint fixes"
+            git push --no-verify
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Reply & re-request review
+        if: steps.commit.outputs.changed == 'true'
+        run: node .github/scripts/reply-and-rerequest.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
